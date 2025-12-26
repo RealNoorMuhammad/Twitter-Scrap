@@ -382,6 +382,24 @@ async def scrape_viral_tweets():
     try:
         await api.pool.login_all()
         print("All accounts logged in successfully.")
+        
+        # Wait a moment for accounts to become active
+        print("Waiting for accounts to become active...")
+        await asyncio.sleep(2)
+        
+        # Verify accounts are active (with error handling)
+        try:
+            if hasattr(api.pool, 'accounts'):
+                active_count = len([acc for acc in api.pool.accounts if hasattr(acc, 'is_active') and acc.is_active])
+                if active_count > 0:
+                    print(f"✓ {active_count} account(s) are active and ready")
+                else:
+                    print("⚠️  Warning: No active accounts detected, but continuing anyway...")
+            else:
+                print("✓ Accounts logged in (status check unavailable)")
+        except Exception as e:
+            print(f"⚠️  Could not check account status: {e}")
+            print("   Continuing anyway - accounts should still work...")
     except Exception as e:
         error_str = str(e)
         print(f"Error during login: {e}")
@@ -454,7 +472,13 @@ async def scrape_viral_tweets():
 async def perform_scraping_cycle(api, sent_tweets):
     """Perform one scraping cycle"""
     since_date = (datetime.now() - timedelta(days=MAX_AGE_DAYS)).strftime("%Y-%m-%d")
-    base_query = f"since:{since_date} min_faves:{MIN_LIKES}"
+    
+    # Build query - use min_faves for minimum likes
+    base_query = f"min_faves:{MIN_LIKES}"
+    
+    # Add date filter if needed
+    if MAX_AGE_DAYS > 0:
+        base_query = f"{base_query} since:{since_date}"
     
     if TWEET_TYPES == "media_only":
         query = f"{base_query} filter:media"
@@ -468,18 +492,90 @@ async def perform_scraping_cycle(api, sent_tweets):
 
     print(f"Searching for viral tweets ({query_description})")
     print(f"   Query: '{query}'")
+    print(f"   Minimum likes: {MIN_LIKES:,}")
+    print(f"   Date range: Last {MAX_AGE_DAYS} day(s)")
 
     tweet_count = 0
     new_tweets_sent = 0
     duplicates_skipped = 0
     tweets_found = False
     
+    # Check if we have active accounts
     try:
-        search_iter = api.search(query, limit=50)
+        if hasattr(api.pool, 'accounts'):
+            active_accounts = [acc for acc in api.pool.accounts if hasattr(acc, 'is_active') and acc.is_active]
+            if not active_accounts:
+                print("⚠️  No active accounts detected. Attempting to refresh...")
+                await asyncio.sleep(1)
+                # Try to get an account for the queue
+                try:
+                    account = await asyncio.wait_for(api.pool.get_for_queue_or_wait(), timeout=5.0)
+                    if account:
+                        print(f"✓ Account available: {account.username if hasattr(account, 'username') else 'unknown'}")
+                except asyncio.TimeoutError:
+                    print("⚠️  Timeout waiting for account. Continuing anyway...")
+                except Exception as e:
+                    print(f"⚠️  Could not get active account: {e}")
+                    print("   Continuing anyway - search might still work...")
+            else:
+                print(f"✓ {len(active_accounts)} account(s) ready for search")
+    except Exception as e:
+        print(f"⚠️  Warning checking account status: {e}")
+        print("   Continuing with search anyway...")
+    
+    try:
+        print("Starting search...")
         
-        async for tweet in search_iter:
-            tweets_found = True
+        # Retry logic for search
+        max_retries = 3
+        retry_count = 0
+        search_success = False
+        
+        while retry_count < max_retries and not search_success:
             try:
+                # Try to initialize search
+                search_iter = api.search(query, limit=50)
+                search_success = True
+                print("✓ Search initialized successfully")
+            except Exception as search_init_error:
+                retry_count += 1
+                error_str = str(search_init_error)
+                if "No active accounts" in error_str or "get_for_queue_or_wait" in error_str or "Stopping" in error_str:
+                    if retry_count < max_retries:
+                        wait_time = retry_count * 2
+                        print(f"⚠️  Account not ready (attempt {retry_count}/{max_retries}). Waiting {wait_time} seconds...")
+                        await asyncio.sleep(wait_time)
+                        # Try to refresh account status
+                        try:
+                            if hasattr(api.pool, 'login_all'):
+                                print("   Attempting to refresh account status...")
+                                await asyncio.sleep(1)
+                        except:
+                            pass
+                        continue
+                    else:
+                        print(f"❌ Failed to get active account after {max_retries} attempts")
+                        print("   The account may need cookies for better authentication.")
+                        print("   Will retry on next monitoring cycle.")
+                        return 0
+                else:
+                    # For other errors, log and try once more
+                    if retry_count < max_retries:
+                        print(f"⚠️  Search error (attempt {retry_count}/{max_retries}): {error_str[:100]}")
+                        await asyncio.sleep(2)
+                        continue
+                    else:
+                        raise  # Re-raise on final attempt
+        
+        if not search_success:
+            print("❌ Could not initialize search")
+            return 0
+        
+        # Process tweets from search
+        try:
+            async for tweet in search_iter:
+                tweets_found = True
+                try:
                 tweet_count += 1
                 
                 # Safely get tweet ID
@@ -585,16 +681,29 @@ async def perform_scraping_cycle(api, sent_tweets):
                 continue
 
     except Exception as e:
-        print(f"Error during scraping cycle: {e}")
-        import traceback
-        traceback.print_exc()
+        error_str = str(e)
+        if "No active accounts" in error_str or "get_for_queue_or_wait" in error_str:
+            print(f"\n⚠️  Account activation issue: {error_str}")
+            print("   This usually means the account needs more time to activate.")
+            print("   Solutions:")
+            print("   1. Wait a moment and the next cycle will retry")
+            print("   2. Add cookies from browser for better authentication (see CLOUDFLARE_FIX.md)")
+            print("   3. The scraper will automatically retry on the next cycle")
+        else:
+            print(f"Error during scraping cycle: {e}")
+            import traceback
+            traceback.print_exc()
     
     if not tweets_found and tweet_count == 0:
         print("\nNo tweets found matching the search criteria.")
-        print("   Try:")
-        print("   - Lowering MIN_LIKES threshold")
-        print("   - Increasing MAX_AGE_DAYS")
-        print("   - Changing TWEET_TYPES to 'all'")
+        print("   This could mean:")
+        print("   - No tweets match your criteria (too restrictive)")
+        print("   - Account needs more time to activate")
+        print("   - Search query needs adjustment")
+        print(f"\n   Try:")
+        print(f"   - Lowering MIN_LIKES threshold (currently: {MIN_LIKES:,})")
+        print(f"   - Increasing MAX_AGE_DAYS (currently: {MAX_AGE_DAYS})")
+        print(f"   - Changing TWEET_TYPES to 'all' (currently: {TWEET_TYPES})")
 
     print(f"\nCycle Results:")
     print(f"   Total tweets found: {tweet_count}")

@@ -97,3 +97,4 @@ This will try to extract cookies automatically from your browser.
 
 When you log in via browser, Twitter sets cookies that prove you're a real user. Using these cookies in the scraper makes Twitter think it's your browser, bypassing Cloudflare protection.
 
+

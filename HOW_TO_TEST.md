@@ -179,3 +179,4 @@ To stop the scraper, press `Ctrl+C`
 4. Verify your credentials are correct (no typos, no extra spaces)
 
 
+
